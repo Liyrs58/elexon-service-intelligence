@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "s0142"
+version = "0.1.0"
+description = "Version-aware parser and validator for the Elexon SAA-I014 sub-flow 2 (S0142) settlement report."
+readme = "README.md"
+requires-python = ">=3.12"
+license = "MIT"
+authors = [{name = "s0142 contributors"}]
+dependencies = ["duckdb>=1.1"]
+
+[project.optional-dependencies]
+extract = ["xlrd>=2.0.1"]
+
+[project.scripts]
+s0142 = "s0142.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+s0142 = ["data/*.json", "data/*.md"]

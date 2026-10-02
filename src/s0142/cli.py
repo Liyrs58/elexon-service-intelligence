@@ -26,11 +26,17 @@ def main(argv: list[str] | None = None) -> int:
     validate.add_argument("--database", default=":memory:")
     validate.add_argument("--layout-version", default=None, help="layout to check against, instead of AAA")
     validate.add_argument("--json", action="store_true")
+    validate.add_argument(
+        "--strict",
+        action="store_true",
+        help="treat Part 1 style warnings as failures",
+    )
 
     parse = commands.add_parser("parse", help="load a file into a DuckDB database")
     parse.add_argument("file", type=Path)
     parse.add_argument("--database", required=True)
     parse.add_argument("--layout-version", default=None)
+    parse.add_argument("--strict", action="store_true")
 
     extract = commands.add_parser("extract", help="extract the S0142 layout from the IDD workbook")
     extract.add_argument("--workbook", type=Path, required=True)
@@ -43,10 +49,13 @@ def main(argv: list[str] | None = None) -> int:
     benchmark = commands.add_parser("benchmark", help="time parse and validate on a synthetic file")
     benchmark.add_argument("--records", type=int, default=1_000_000)
     benchmark.add_argument("--keep", type=Path, default=None, help="keep the synthetic file at this path")
+    benchmark.add_argument("--strict", action="store_true")
 
     args = parser.parse_args(argv)
     if args.command == "validate":
-        report, connection = load_file(args.file, database=args.database, version=args.layout_version)
+        report, connection = load_file(
+            args.file, database=args.database, version=args.layout_version, strict=args.strict
+        )
         connection.close()
         if args.json:
             print(json.dumps(report.to_json(), indent=2))
@@ -54,7 +63,9 @@ def main(argv: list[str] | None = None) -> int:
             sys.stdout.write(render_text(report))
         return 0 if report.ok else 1
     if args.command == "parse":
-        report, connection = load_file(args.file, database=str(args.database), version=args.layout_version)
+        report, connection = load_file(
+            args.file, database=str(args.database), version=args.layout_version, strict=args.strict
+        )
         connection.close()
         sys.stdout.write(render_text(report))
         return 0 if report.ok else 1
@@ -74,12 +85,12 @@ def main(argv: list[str] | None = None) -> int:
         print(f"wrote valid fixtures and {', '.join(DEFECT_KINDS)} under {args.directory}")
         return 0
     if args.command == "benchmark":
-        return _benchmark(args.records, args.keep)
+        return _benchmark(args.records, args.keep, args.strict)
     parser.error(f"unknown command {args.command}")
     return 2
 
 
-def _benchmark(records: int, keep: Path | None) -> int:
+def _benchmark(records: int, keep: Path | None, strict: bool) -> int:
     if keep is None:
         handle = tempfile.NamedTemporaryFile(prefix="s0142-bench-", suffix=".txt", delete=False)
         path = Path(handle.name)
@@ -92,7 +103,7 @@ def _benchmark(records: int, keep: Path | None) -> int:
     started = time.perf_counter()
     body = write_benchmark_file(path, body_records=records)
     generated = time.perf_counter()
-    report, connection = load_file(path, database=str(database))
+    report, connection = load_file(path, database=str(database), strict=strict)
     connection.close()
     finished = time.perf_counter()
     rss_kb = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
@@ -102,7 +113,9 @@ def _benchmark(records: int, keep: Path | None) -> int:
         "generate_seconds": round(generated - started, 3),
         "parse_validate_seconds": round(finished - generated, 3),
         "max_rss_kb": rss_kb,
-        "defects": len(report.defects),
+        "defects": len(report.errors),
+        "warnings": len(report.warnings),
+        "strict": strict,
         "layout_version": report.layout_version,
         "database": str(database),
         "file": str(path),

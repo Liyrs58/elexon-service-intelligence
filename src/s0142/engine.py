@@ -1,8 +1,7 @@
 """Parse an S0142 file and load it into DuckDB, recording structural defects.
 
-Physical framing (pipe separator, AAA version token, ZZZ trailer) is not defined
-on the S0142 rows of the workbook. Those choices are isolated in this module
-and listed as UNRESOLVED in the spec.
+Framing, the AAA header, the ZZZ count and checksum, and the lexical pictures
+come from NETA IDD Part 1 v64.0. See ``s0142.part1``.
 """
 
 from __future__ import annotations
@@ -17,11 +16,11 @@ from pathlib import Path
 
 import duckdb
 
+from s0142.part1 import VALID_SETS, file_type_version, xor_record
 from s0142.rules import DELETED_ACCEPTANCE, DELETION_VALUE_FIELDS
 from s0142.specio import Spec, VersionLayout, load_spec
-from s0142.typesys import ParsedType, check_lexical
+from s0142.typesys import Finding, ParsedType, check_lexical
 
-_FILE_TYPE = re.compile(r"^S0142(\d{3})$")
 _IDENT = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
 
@@ -33,10 +32,12 @@ class Defect:
     record_type: str | None
     field_id: str | None
     message: str
+    severity: str = "error"
 
     def to_json(self) -> dict:
         return {
             "code": self.code,
+            "severity": self.severity,
             "line": self.line,
             "field_index": self.field_index,
             "record_type": self.record_type,
@@ -70,10 +71,23 @@ class Report:
     defects: list[Defect] = field(default_factory=list)
     deletion_signals: list[DeletionSignal] = field(default_factory=list)
     unresolved_ids: list[str] = field(default_factory=list)
+    strict: bool = False
+
+    @property
+    def errors(self) -> list[Defect]:
+        return [item for item in self.defects if item.severity != "warning"]
+
+    @property
+    def warnings(self) -> list[Defect]:
+        return [item for item in self.defects if item.severity == "warning"]
 
     @property
     def ok(self) -> bool:
-        return not self.defects
+        if self.errors:
+            return False
+        if self.strict and self.warnings:
+            return False
+        return True
 
     def to_json(self) -> dict:
         return {
@@ -81,8 +95,10 @@ class Report:
             "declared_version": self.declared_version,
             "layout_version": self.layout_version,
             "body_records": self.body_records,
+            "strict": self.strict,
             "ok": self.ok,
-            "defects": [item.to_json() for item in self.defects],
+            "defects": [item.to_json() for item in self.errors],
+            "warnings": [item.to_json() for item in self.warnings],
             "deletion_signals": [item.to_json() for item in self.deletion_signals],
             "unresolved_ids": self.unresolved_ids,
         }
@@ -102,31 +118,81 @@ def _quote(identifier: str) -> str:
     return f'"{identifier}"'
 
 
-def _values(parts: list[str]) -> list[str]:
+@dataclass(frozen=True)
+class Physical:
+    line_no: int
+    raw: bytes
+    parts: list[str]
+    crlf: bool
+    missing_lf: bool
+    terminal_pipe: bool
+    ascii_ok: bool
+
+    @property
+    def record_type(self) -> str:
+        if not self.parts:
+            return ""
+        return self.parts[0]
+
+
+def _values(record: Physical) -> list[str]:
     """Fields after the record type.
 
-    A terminal pipe is not a field: one trailing empty piece is removed.
-    ``TYPE|a|b|`` and ``TYPE|a|b`` both yield ``['a', 'b']``. ``TYPE|a||``
-    yields ``['a', '']``. A record whose last field is empty and which also
-    omits the terminal pipe is indistinguishable from a shorter record.
+    Part 1 puts a pipe after the last field, so a well-formed record ends
+    with an empty split piece. That piece is not a field. A missing terminal
+    pipe is reported separately and the last piece is kept.
     """
 
-    values = parts[1:]
-    if values and values[-1] == "":
+    values = record.parts[1:]
+    if record.terminal_pipe and values and values[-1] == "":
         values = values[:-1]
     return values
 
 
-def _version_from_aaa(parts: list[str]) -> str | None:
-    values = _values(parts)
-    if not values:
-        return None
-    match = _FILE_TYPE.fullmatch(values[0])
-    if match:
-        return match.group(1)
-    if len(values) >= 2 and values[0] == "S0142" and re.fullmatch(r"\d{3}", values[1]):
-        return values[1]
-    return None
+def _iter_physical(path: Path, defects: list[Defect]):
+    with path.open("rb") as handle:
+        prefix = handle.read(3)
+        if prefix == b"\xef\xbb\xbf":
+            defects.append(
+                Defect(
+                    "framing",
+                    1,
+                    None,
+                    None,
+                    None,
+                    "The file starts with a UTF-8 BOM. IDD Part 1 files are ASCII.",
+                )
+            )
+        else:
+            handle.seek(0)
+        line_no = 0
+        while True:
+            blob = handle.readline()
+            if not blob:
+                break
+            line_no += 1
+            missing_lf = not blob.endswith(b"\n")
+            if blob.endswith(b"\n"):
+                blob = blob[:-1]
+            crlf = blob.endswith(b"\r")
+            if crlf:
+                blob = blob[:-1]
+            try:
+                text = blob.decode("ascii")
+                ascii_ok = True
+            except UnicodeDecodeError:
+                text = ""
+                ascii_ok = False
+            parts = text.split("|") if ascii_ok else []
+            yield Physical(
+                line_no=line_no,
+                raw=blob,
+                parts=parts,
+                crlf=crlf,
+                missing_lf=missing_lf,
+                terminal_pipe=blob.endswith(b"|"),
+                ascii_ok=ascii_ok,
+            )
 
 
 def _matching_versions(spec: Spec, record_type: str, count: int) -> list[str]:
@@ -158,7 +224,8 @@ def _create_schema(connection, layout: VersionLayout, sha256: str) -> None:
             layout_version VARCHAR,
             workbook_sha256 VARCHAR,
             body_records BIGINT,
-            defect_count BIGINT
+            defect_count BIGINT,
+            warning_count BIGINT
         )
         """
     )
@@ -170,7 +237,8 @@ def _create_schema(connection, layout: VersionLayout, sha256: str) -> None:
             field_index INTEGER,
             record_type VARCHAR,
             field_id VARCHAR,
-            message VARCHAR
+            message VARCHAR,
+            severity VARCHAR
         )
         """
     )
@@ -228,8 +296,8 @@ def _create_schema(connection, layout: VersionLayout, sha256: str) -> None:
         connection.execute(f"CREATE TABLE {_quote('rec_' + group.id.lower())} ({', '.join(columns)})")
     _copy_rows(connection, "layout_field", field_rows)
     connection.execute(
-        "INSERT INTO file_info VALUES (?, ?, ?, ?, ?, ?)",
-        [None, None, layout.version, sha256, 0, 0],
+        "INSERT INTO file_info VALUES (?, ?, ?, ?, ?, ?, ?)",
+        [None, None, layout.version, sha256, 0, 0, 0],
     )
 
 
@@ -252,50 +320,24 @@ def _copy_rows(connection, table: str, rows) -> None:
         os.unlink(path)
 
 
-def _iter_records(path: Path):
-    with path.open("r", encoding="utf-8", newline="") as handle:
-        first_physical = True
-        for line_no, raw in enumerate(handle, start=1):
-            text = raw.rstrip("\n").rstrip("\r")
-            if first_physical:
-                text = text.lstrip("\ufeff")
-                first_physical = False
-            if text.strip() == "":
-                continue
-            yield line_no, text.split("|")
-
-
 def load_file(
     path: str | Path,
     database: str = ":memory:",
     version: str | None = None,
     spec: Spec | None = None,
+    strict: bool = False,
 ) -> tuple[Report, duckdb.DuckDBPyConnection]:
     spec = spec or load_spec()
     path = Path(path)
     defects: list[Defect] = []
     signals: list[DeletionSignal] = []
-    declared: str | None = None
-    pending = _iter_records(path)
+    pending = _iter_physical(path, defects)
     try:
         first = next(pending)
     except StopIteration:
         first = None
-    aaa_line = None
-    if first is not None and first[1] and first[1][0] == "AAA":
-        aaa_line = first[0]
-        declared = _version_from_aaa(first[1])
-        if declared is None:
-            defects.append(
-                Defect(
-                    "version_mismatch",
-                    aaa_line,
-                    None,
-                    "AAA",
-                    None,
-                    "AAA is present but its file type is not S0142 plus a three-digit layout version.",
-                )
-            )
+    declared = _peek_version(first)
+    aaa_line = first.line_no if first is not None and first.record_type == "AAA" else None
 
     override = version
     if override is not None and override not in spec.versions:
@@ -328,37 +370,15 @@ def load_file(
             )
         )
 
-    records: list[tuple[int, list[str]]] | None = None
+    records: list[Physical] | None = None
     if layout_version is None:
         records = [] if first is None else [first]
         records.extend(pending)
         if aaa_line is None:
-            for line_no, parts in records:
-                if parts and parts[0] == "AAA":
-                    aaa_line = line_no
-                    declared = _version_from_aaa(parts)
-                    if records and records[0][0] != aaa_line:
-                        defects.append(
-                            Defect(
-                                "framing",
-                                aaa_line,
-                                None,
-                                "AAA",
-                                None,
-                                "AAA is not the first record.",
-                            )
-                        )
-                    if declared is None:
-                        defects.append(
-                            Defect(
-                                "version_mismatch",
-                                aaa_line,
-                                None,
-                                "AAA",
-                                None,
-                                "AAA is present but its file type is not S0142 plus a three-digit layout version.",
-                            )
-                        )
+            for record in records:
+                if record.record_type == "AAA":
+                    aaa_line = record.line_no
+                    declared = _peek_version(record)
                     break
         compatible = _infer_versions(spec, records)
         if unknown_declaration:
@@ -394,16 +414,20 @@ def load_file(
     root = _Open("", 0, 0, {})
     stack = [root]
     body_records = 0
-    seen_trailer = False
     scratch = tempfile.TemporaryDirectory(prefix="s0142-load-")
     writers: dict[str, tuple] = {}
+    checksum = 0
+    physical_count = 0
+    last_record: Physical | None = None
+    saw_aaa = False
+    zzz_count = 0
 
     def _emit(table: str, row: tuple) -> None:
         slot = writers.get(table)
         if slot is None:
-            path = Path(scratch.name) / f"{table}.csv"
-            handle = path.open("w", encoding="utf-8", newline="")
-            slot = (handle, csv.writer(handle), path)
+            csv_path = Path(scratch.name) / f"{table}.csv"
+            handle = csv_path.open("w", encoding="utf-8", newline="")
+            slot = (handle, csv.writer(handle), csv_path)
             writers[table] = slot
         slot[1].writerow(row)
 
@@ -411,30 +435,39 @@ def load_file(
         while stack[-1].level >= level:
             _check_one_cardinality(defects, layout, stack.pop())
 
-    for line_no, parts in _records():
-        record_type = parts[0] if parts else ""
-        if record_type in {"AAA", "ZZZ"}:
-            if record_type == "ZZZ" and seen_trailer:
-                defects.append(Defect("framing", line_no, None, "ZZZ", None, "More than one ZZZ trailer."))
-            if record_type == "ZZZ":
-                seen_trailer = True
-            if seen_trailer and record_type not in {"ZZZ"}:
-                defects.append(Defect("framing", line_no, None, record_type, None, "Record follows the ZZZ trailer."))
+    for record in _records():
+        physical_count += 1
+        checksum = xor_record(checksum, record.raw)
+        last_record = record
+        _framing_defects(defects, record)
+        if not record.ascii_ok or record.raw == b"":
             continue
-        if seen_trailer:
-            defects.append(Defect("framing", line_no, None, record_type, None, "Record follows the ZZZ trailer."))
+        record_type = record.record_type
+        if record_type == "AAA":
+            saw_aaa = True
+            if physical_count != 1:
+                defects.append(
+                    Defect("framing", record.line_no, None, "AAA", None, "AAA is not the first record.")
+                )
+            defects.extend(_aaa_fields(record))
+            continue
+        if record_type == "ZZZ":
+            zzz_count += 1
+            if zzz_count > 1:
+                defects.append(Defect("framing", record.line_no, None, "ZZZ", None, "More than one ZZZ trailer."))
             continue
         body_records += 1
         if layout is None:
             continue
         group = layout.by_id.get(record_type)
+        values = _values(record)
         if group is None:
-            matches = _matching_versions(spec, record_type, len(_values(parts)))
+            matches = _matching_versions(spec, record_type, len(values))
             if matches and layout_version not in matches:
                 defects.append(
                     Defect(
                         "version_mismatch",
-                        line_no,
+                        record.line_no,
                         None,
                         record_type,
                         None,
@@ -445,7 +478,7 @@ def load_file(
                 defects.append(
                     Defect(
                         "unknown_record",
-                        line_no,
+                        record.line_no,
                         None,
                         record_type,
                         None,
@@ -454,14 +487,13 @@ def load_file(
                 )
             continue
 
-        values = _values(parts)
         if len(values) != group.field_count:
             matches = _matching_versions(spec, record_type, len(values))
             if matches and layout_version not in matches:
                 defects.append(
                     Defect(
                         "version_mismatch",
-                        line_no,
+                        record.line_no,
                         None,
                         record_type,
                         None,
@@ -475,7 +507,7 @@ def load_file(
                 defects.append(
                     Defect(
                         "field_count",
-                        line_no,
+                        record.line_no,
                         None,
                         record_type,
                         None,
@@ -487,24 +519,34 @@ def load_file(
                 )
             close_until(group.level)
             opener = stack[-1]
-            _reject_parent(defects, group, opener, line_no, by_id=None)
+            _reject_parent(defects, group, opener, record.line_no, by_id=None)
             opener.child_counts[record_type] = opener.child_counts.get(record_type, 0) + 1
             parent_line = opener.line or None
-            _emit("record_index", (line_no, record_type, parent_line, len(values)))
-            stack.append(_Open(record_type, line_no, group.level, {}))
+            _emit("record_index", (record.line_no, record_type, parent_line, len(values)))
+            stack.append(_Open(record_type, record.line_no, group.level, {}))
             continue
 
         by_id = {item.id: values[item.order] for item in group.fields}
         close_until(group.level)
         opener = stack[-1]
         parent_line = opener.line or None
-        parent_ok = _reject_parent(defects, group, opener, line_no, by_id=by_id)
-        _check_fields(defects, signals, group, by_id, line_no, parent_ok)
+        parent_ok = _reject_parent(defects, group, opener, record.line_no, by_id=by_id)
+        _check_fields(defects, signals, group, by_id, record.line_no, parent_ok)
         opener.child_counts[record_type] = opener.child_counts.get(record_type, 0) + 1
-        stack.append(_Open(record_type, line_no, group.level, {}))
-        _emit("record_index", (line_no, record_type, parent_line, len(values)))
-        row = (line_no, parent_line, *[by_id[item.id] if by_id[item.id] != "" else None for item in group.fields])
+        stack.append(_Open(record_type, record.line_no, group.level, {}))
+        _emit("record_index", (record.line_no, record_type, parent_line, len(values)))
+        row = (record.line_no, parent_line, *[by_id[item.id] if by_id[item.id] != "" else None for item in group.fields])
         _emit("rec_" + group.id.lower(), row)
+
+    if not saw_aaa:
+        defects.append(Defect("framing", None, None, "AAA", None, "AAA header is missing."))
+    if last_record is not None and last_record.record_type == "ZZZ" and last_record.ascii_ok:
+        checksum = xor_record(checksum, last_record.raw)
+        defects.extend(_zzz_fields(last_record, physical_count, checksum))
+    else:
+        defects.append(Defect("framing", None, None, "ZZZ", None, "ZZZ trailer is missing."))
+    if zzz_count and (last_record is None or last_record.record_type != "ZZZ"):
+        defects.append(Defect("framing", None, None, "ZZZ", None, "ZZZ is not the last record."))
 
     while stack:
         _check_one_cardinality(defects, layout, stack.pop())
@@ -521,7 +563,15 @@ def load_file(
                 connection,
                 "defects",
                 [
-                    (item.code, item.line, item.field_index, item.record_type, item.field_id, item.message)
+                    (
+                        item.code,
+                        item.line,
+                        item.field_index,
+                        item.record_type,
+                        item.field_id,
+                        item.message,
+                        item.severity,
+                    )
                     for item in defects
                 ],
             )
@@ -530,34 +580,282 @@ def load_file(
                 "deletion_signals",
                 [(item.line, item.record_type, json.dumps(list(item.value_fields))) for item in signals],
             )
+            error_count = sum(1 for item in defects if item.severity != "warning")
+            warning_count = sum(1 for item in defects if item.severity == "warning")
             connection.execute(
-                "UPDATE file_info SET path = ?, declared_version = ?, layout_version = ?, body_records = ?, defect_count = ?",
-                [str(path), declared, layout_version, body_records, len(defects)],
+                """
+                UPDATE file_info
+                SET path = ?, declared_version = ?, layout_version = ?, body_records = ?,
+                    defect_count = ?, warning_count = ?
+                """,
+                [str(path), declared, layout_version, body_records, error_count, warning_count],
             )
     finally:
         scratch.cleanup()
 
     report = Report(
         path=str(path),
-        declared_version=declared if override is None else override,
+        declared_version=declared,
         layout_version=layout_version,
         body_records=body_records,
         defects=defects,
         deletion_signals=signals,
         unresolved_ids=[item["id"] for item in spec.unresolved],
+        strict=strict,
     )
-    if override is not None:
-        report.declared_version = declared
     return report, connection
 
 
-def _infer_versions(spec: Spec, lines: list[tuple[int, list[str]]]) -> list[str]:
+def _peek_version(record: Physical | None) -> str | None:
+    if record is None or record.record_type != "AAA" or not record.ascii_ok:
+        return None
+    values = _values(record)
+    if not values:
+        return None
+    return file_type_version(values[0])
+
+
+def _framing_defects(defects: list[Defect], record: Physical) -> None:
+    if not record.ascii_ok:
+        defects.append(
+            Defect(
+                "framing",
+                record.line_no,
+                None,
+                None,
+                None,
+                "Record is not ASCII. IDD Part 1 files use the ASCII character set.",
+            )
+        )
+        return
+    if record.crlf or b"\r" in record.raw:
+        defects.append(
+            Defect(
+                "framing",
+                record.line_no,
+                None,
+                record.record_type or None,
+                None,
+                "Record contains CR. Part 1 delimits records with a line feed only.",
+            )
+        )
+    if record.missing_lf:
+        defects.append(
+            Defect(
+                "framing",
+                record.line_no,
+                None,
+                record.record_type or None,
+                None,
+                "Record does not end with a line feed.",
+            )
+        )
+    if record.raw == b"":
+        defects.append(Defect("framing", record.line_no, None, None, None, "Empty record."))
+        return
+    if not record.terminal_pipe:
+        defects.append(
+            Defect(
+                "framing",
+                record.line_no,
+                None,
+                record.record_type or None,
+                None,
+                "Record has no pipe after the last field.",
+            )
+        )
+
+
+def _aaa_fields(record: Physical) -> list[Defect]:
+    from s0142.typesys import parse_type
+
+    values = _values(record)
+    found: list[Defect] = []
+    version = file_type_version(values[0]) if values else None
+    if len(values) != 9:
+        found.append(
+            Defect(
+                "framing",
+                record.line_no,
+                None,
+                "AAA",
+                None,
+                f"AAA has {len(values) + 1} fields; Part 1 defines 10, with a pipe after the last field.",
+            )
+        )
+        if version is None:
+            found.append(
+                Defect(
+                    "version_mismatch",
+                    record.line_no,
+                    1,
+                    "AAA",
+                    "file_type",
+                    "AAA file type is not S0142 plus a three-digit version.",
+                )
+            )
+        return found
+    file_type, role, created, from_role, from_id, to_role, to_id, sequence, test_flag = values
+    if version is None:
+        found.append(
+            Defect(
+                "version_mismatch",
+                record.line_no,
+                2,
+                "AAA",
+                "file_type",
+                f"AAA file type {file_type!r} is not S0142 plus a three-digit version.",
+            )
+        )
+    else:
+        _apply(found, check_lexical(file_type, parse_type("text(8)")), record.line_no, 2, "AAA", "file_type")
+    if role not in {"D", "R"}:
+        found.append(
+            Defect(
+                "bad_type",
+                record.line_no,
+                3,
+                "AAA",
+                "message_role",
+                f"Message role {role!r} is not D or R.",
+            )
+        )
+    _apply(found, check_lexical(created, parse_type("datetime")), record.line_no, 4, "AAA", "creation_time")
+    for index, field_id, value, kind in (
+        (5, "from_role_code", from_role, "text(2)"),
+        (6, "from_participant_id", from_id, "text(8)"),
+        (7, "to_role_code", to_role, "text(2)"),
+        (8, "to_participant_id", to_id, "text(8)"),
+    ):
+        if value == "":
+            found.append(
+                Defect(
+                    "missing_required",
+                    record.line_no,
+                    index,
+                    "AAA",
+                    field_id,
+                    f"AAA {field_id} is empty.",
+                )
+            )
+        else:
+            _apply(found, check_lexical(value, parse_type(kind)), record.line_no, index, "AAA", field_id)
+    if sequence == "":
+        found.append(
+            Defect(
+                "missing_required",
+                record.line_no,
+                8,
+                "AAA",
+                "sequence_number",
+                "AAA sequence number is empty.",
+            )
+        )
+    else:
+        _apply(found, check_lexical(sequence, parse_type("integer(9)")), record.line_no, 8, "AAA", "sequence_number")
+    if test_flag != "":
+        _apply(found, check_lexical(test_flag, parse_type("text(4)")), record.line_no, 9, "AAA", "test_data_flag")
+    return found
+
+
+def _zzz_fields(record: Physical, physical_count: int, checksum: int) -> list[Defect]:
+    from s0142.typesys import parse_type
+
+    values = _values(record)
+    found: list[Defect] = []
+    if len(values) != 2:
+        found.append(
+            Defect(
+                "framing",
+                record.line_no,
+                None,
+                "ZZZ",
+                None,
+                f"ZZZ has {len(values) + 1} fields; Part 1 defines 3, with a pipe after the last field.",
+            )
+        )
+    integer = parse_type("integer(10)")
+    if len(values) >= 1 and values[0] != "":
+        findings = check_lexical(values[0], integer)
+        if any(item.severity == "error" for item in findings):
+            _apply(found, findings, record.line_no, 1, "ZZZ", "record_count")
+        else:
+            if int(values[0]) != physical_count:
+                found.append(
+                    Defect(
+                        "record_count",
+                        record.line_no,
+                        1,
+                        "ZZZ",
+                        "record_count",
+                        f"ZZZ record count is {values[0]}; the file has {physical_count} records, including header and footer.",
+                    )
+                )
+            _apply(
+                found,
+                [item for item in findings if item.severity == "warning"],
+                record.line_no,
+                1,
+                "ZZZ",
+                "record_count",
+            )
+    else:
+        found.append(
+            Defect("record_count", record.line_no, 1, "ZZZ", "record_count", "ZZZ record count is missing.")
+        )
+    if len(values) >= 2 and values[1] != "":
+        findings = check_lexical(values[1], integer)
+        if any(item.severity == "error" for item in findings):
+            _apply(found, findings, record.line_no, 2, "ZZZ", "checksum")
+        else:
+            if int(values[1]) != checksum:
+                found.append(
+                    Defect(
+                        "checksum",
+                        record.line_no,
+                        2,
+                        "ZZZ",
+                        "checksum",
+                        f"ZZZ checksum is {values[1]}; the 32-bit XOR of the records before the trailer is {checksum}.",
+                    )
+                )
+            _apply(
+                found,
+                [item for item in findings if item.severity == "warning"],
+                record.line_no,
+                2,
+                "ZZZ",
+                "checksum",
+            )
+    else:
+        found.append(Defect("checksum", record.line_no, 2, "ZZZ", "checksum", "ZZZ checksum is missing."))
+    return found
+
+
+def _apply(defects, findings: list[Finding], line: int, index: int, record_type: str, field_id: str) -> None:
+    for finding in findings:
+        defects.append(
+            Defect(
+                finding.code,
+                line,
+                index,
+                record_type,
+                field_id,
+                finding.detail,
+                finding.severity,
+            )
+        )
+
+
+def _infer_versions(spec: Spec, lines: list[Physical]) -> list[str]:
     observations: dict[str, set[int]] = {}
-    for _, parts in lines:
-        record_type = parts[0]
-        if record_type in {"AAA", "ZZZ"}:
+    for record in lines:
+        if not record.ascii_ok:
             continue
-        observations.setdefault(record_type, set()).add(len(_values(parts)))
+        record_type = record.record_type
+        if record_type in {"AAA", "ZZZ", ""}:
+            continue
+        observations.setdefault(record_type, set()).add(len(_values(record)))
     compatible = []
     for version, layout in spec.versions.items():
         ok = True
@@ -673,17 +971,35 @@ def _check_fields(defects, signals, group, by_id, line_no: int, parent_ok: bool)
 
 
 def _emit_lexical(defects, record_type: str, item, value: str, line_no: int) -> None:
-    code = check_lexical(value, _parsed_type(item))
-    if code is None:
-        return
-    if code == "bad_precision":
-        message = (
-            f"{item.id} value {value!r} has more fraction digits than {item.data_type} allows. "
-            "The limit is this field's scale, not a file-wide precision."
+    findings = list(check_lexical(value, _parsed_type(item)))
+    if item.valid_set and not any(finding.severity == "error" for finding in findings):
+        allowed = VALID_SETS.get(item.valid_set)
+        if allowed is not None and value not in allowed:
+            findings.append(
+                Finding(
+                    "warning",
+                    "valid_set",
+                    f"{value!r} is not a member of {item.valid_set}.",
+                )
+            )
+    for finding in findings:
+        if finding.code == "bad_precision":
+            message = f"{item.id} value {value!r}: {finding.detail}. The limit is {item.data_type}."
+        elif finding.detail:
+            message = f"{item.id} value {value!r}: {finding.detail}."
+        else:
+            message = f"{item.id} value {value!r} does not match workbook type {item.data_type}."
+        defects.append(
+            Defect(
+                finding.code,
+                line_no,
+                item.order + 1,
+                record_type,
+                item.id,
+                message,
+                finding.severity,
+            )
         )
-    else:
-        message = f"{item.id} value {value!r} does not match workbook type {item.data_type}."
-    defects.append(Defect(code, line_no, item.order + 1, record_type, item.id, message))
 
 
 _CHILDREN: dict[int, dict] = {}
@@ -734,7 +1050,9 @@ def render_text(report: Report) -> str:
         f"declared_version: {declared}",
         f"layout_version: {chosen}",
         f"body_records: {report.body_records}",
-        f"defects: {len(report.defects)}",
+        f"defects: {len(report.errors)}",
+        f"warnings: {len(report.warnings)}",
+        f"strict: {report.strict}",
         f"deletion_signals: {len(report.deletion_signals)}",
         "unresolved: " + ", ".join(report.unresolved_ids),
     ]

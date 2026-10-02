@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass, replace
 from pathlib import Path
 
+from s0142.part1 import aaa_line, seal, xor_record
 from s0142.rules import DELETION_VALUE_FIELDS
 from s0142.specio import Spec, load_spec
 
@@ -25,6 +26,8 @@ def _sample(field, ctx: _Ctx) -> str:
         return str(ctx.period)
     if field.id == "N0202":
         return "II"
+    if field.id == "N0439":
+        return "A"
     if field.id == "N0045":
         return PARTY_ID
     if field.id == "N0034":
@@ -35,7 +38,7 @@ def _sample(field, ctx: _Ctx) -> str:
         and field.kind == "decimal"
         and field.scale is not None
     ):
-        return "-1." + ("0" * field.scale) if field.scale else "-1"
+        return "-1.2" if field.scale else "-1"
     kind = field.kind
     if kind == "date":
         return "20260101"
@@ -55,7 +58,7 @@ def _sample(field, ctx: _Ctx) -> str:
     if kind in {"decimal", "number"} and field.scale is not None:
         if field.scale == 0:
             return "1"
-        return "1." + ("0" * field.scale)
+        return "1." + "2" + ("3" * (field.scale - 1))
     raise RuntimeError(f"no synthetic value for {field.id} {field.data_type}")
 
 
@@ -93,7 +96,7 @@ def _deletion_fp2(layout) -> str | None:
 def valid_lines(version: str, spec: Spec | None = None) -> list[str]:
     spec = spec or load_spec()
     layout = spec.versions[version]
-    lines = [f"AAA|S0142{version}|"]
+    lines = [aaa_line(version)]
 
     def emit(parent_id: str | None, ctx: _Ctx) -> None:
         for child in _children(layout, parent_id):
@@ -113,8 +116,7 @@ def valid_lines(version: str, spec: Spec | None = None) -> list[str]:
                         lines.append(deletion)
 
     emit(None, _Ctx())
-    lines.append("ZZZ|")
-    return lines
+    return seal(lines)
 
 
 def render_valid(version: str, spec: Spec | None = None) -> str:
@@ -199,23 +201,29 @@ def _mutate_omission(lines: list[str]) -> list[str]:
     return out
 
 
+def _unseal(lines: list[str]) -> list[str]:
+    if lines and lines[-1].startswith("ZZZ|"):
+        return lines[:-1]
+    return lines
+
+
 def defect_lines(kind: str, spec: Spec | None = None) -> list[str]:
     spec = spec or load_spec()
-    base = valid_lines("014", spec)
+    base = _unseal(valid_lines("014", spec))
     if kind == "field_count":
-        return _mutate_field_count(base)
+        return seal(_mutate_field_count(base))
     if kind == "bad_type":
-        return _mutate_bad_type(base)
+        return seal(_mutate_bad_type(base))
     if kind == "bad_precision":
-        return _mutate_bad_precision(base, spec)
+        return seal(_mutate_bad_precision(base, spec))
     if kind == "unknown_record":
-        return _insert_after(base, "AAA|", "XYZ|1|")
+        return seal(_insert_after(base, "AAA|", "XYZ|1|"))
     if kind == "parent_child":
-        return _insert_after(base, "SRH|", "MEL|0|1.000|30|1.000|")
+        return seal(_insert_after(base, "SRH|", "MEL|0|1.2|30|1.2|"))
     if kind == "version_mismatch":
-        return _mutate_version(base)
+        return seal(_mutate_version(base))
     if kind == "omission_deletion":
-        return _mutate_omission(base)
+        return seal(_mutate_omission(base))
     raise ValueError(kind)
 
 
@@ -255,23 +263,33 @@ def write_benchmark_file(path: Path, body_records: int = 1_000_000, version: str
     extra = body_records - len(body)
     if extra < 0:
         raise RuntimeError(f"skeleton already has {len(body)} body records")
-    mel = "MEL|0|1.000|30|1.000|"
+    mel = "MEL|0|1.2|30|1.2|"
     path.parent.mkdir(parents=True, exist_ok=True)
     written_body = 0
     padded = False
-    with path.open("w", encoding="utf-8", newline="\n") as handle:
+    checksum = 0
+    physical = 0
+    with path.open("wb") as handle:
         for line in skeleton:
             if line.startswith("ZZZ|"):
-                if not padded:
-                    raise RuntimeError("no BPI row found to attach MEL rows")
-                handle.write(line + "\n")
                 continue
-            handle.write(line + "\n")
+            raw = line.encode("ascii")
+            handle.write(raw + b"\n")
+            checksum = xor_record(checksum, raw)
+            physical += 1
             if not line.startswith("AAA|"):
                 written_body += 1
             if not padded and line.startswith("BPI|"):
+                raw_mel = mel.encode("ascii")
                 for _ in range(extra):
-                    handle.write(mel + "\n")
+                    handle.write(raw_mel + b"\n")
+                    checksum = xor_record(checksum, raw_mel)
                 written_body += extra
+                physical += extra
                 padded = True
+        if not padded:
+            raise RuntimeError("no BPI row found to attach MEL rows")
+        physical += 1
+        trailer = f"ZZZ|{physical}|{checksum}|".encode("ascii")
+        handle.write(trailer + b"\n")
     return written_body

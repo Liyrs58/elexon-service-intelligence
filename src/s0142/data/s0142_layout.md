@@ -4452,39 +4452,27 @@ A required mark with a comment that talks about nulls or conditional population.
 
 ### sign-convention
 
-The S0142 rows do not state how to read the sign of a cashflow or a volume. No S0142 name or comment contains 'sign'. The validator stores the sign character and does not interpret it.
+The S0142 rows do not state how to read the sign of a cashflow or a volume. No S0142 name or comment contains 'sign'. IDD Part 1 section 2.2 does not state it either. The validator stores the sign character and does not interpret it.
 
-### decimal-length-parameter
+### omission-not-enforceable
 
-The Items sheet headers are Length and Precision. For S0142 decimal types those two columns are empty; only the full type string is filled. Precision in the second parameter is enforced as a maximum number of digits after the decimal point. Whether the first parameter counts digits before the decimal point or total significant digits is not stated, so it is not a failing check.
+Change-only omission of MEL, MIL, FP2, BO2 and BO6 needs a baseline file. These records have no data-version field. The D-run baseline is not stated. The II/RF full-set wording, the BO4 send condition and the incomplete BO7 sentence are listed under omission_rules.not_enforced. They are not guessed.
 
-### lexical-pictures
+### portal-byte-identity
 
-The workbook type names are date, datetime and boolean, with no picture. Accepted forms are an assumption documented in the README: YYYYMMDD, YYYYMMDDHHMMSS, and a short boolean word list. Valid-set names referenced by S0142, whose members are not listed in this workbook: P/C Flag, Price Derivation Code, Quarter Hour Period, Run Type.
+NETA IDD Part 1 v64.0 (effective 2026-06-25) sections 2.2.1, 2.2.2, 2.2.3, 2.2.11.24, 2.2.11.27, 2.2.11.30 define the flow file. SHA-256 of the HTML copy used for that reading: 2530cdcc980329d41466c043eeb1f0b776b3fdcf49f6310f1bf4bf057078d547. Nothing in that document says a P114 portal extract is the same bytes.
 
-### physical-framing
+### quarter-hour-period
 
-The S0142 blocks do not name a field separator or a file header or trailer. Pipes, an AAA file-type version and a ZZZ trailer are assumptions. AAA and ZZZ field lists are not validated. Worksheets in this file: 'Multiple', 'SO', 'BSCC Ltd', 'FAA', 'Stage 2', 'Internal', 'NGC ', 'SVAA', 'Items'.
-
-### sibling-order
-
-Parentage is taken from the L1-L9 marks. The workbook does not say that siblings must appear in sheet order. Sibling order is not enforced.
+N0602 names the valid set Quarter Hour Period. IDD Part 1 section 2.2.11 has no matching heading, so membership is not checked.
 
 ### which-version-applies
 
 v014 comments say the P444 fields are populated for post-P444 settlement dates. The workbook does not give that date, and it does not say which layout version a file of a given date must use. The parser reads the version from the file. It does not infer one from the settlement date.
 
-### null-token
-
-Optional fields may be empty. The workbook does not say that the four characters NULL mean absent, and it does not say that an empty field means zero. Empty optional fields are loaded as SQL NULL. The token NULL is a bad value for a numeric type.
-
 ### same-as-null
 
 The workbook comment on N0388 says a null means the same value as Period BM Unit Total Accepted Bid Volume, and N0389 has a similar comment. That is not a deletion and not zero. This tool does not copy the other field into the empty one.
-
-### omission-not-enforceable
-
-Change-only omission, the II/RF full-set wording, the BO4 send condition, the incomplete BO7 sentence, and the missing D-run baseline are listed under omission_rules.not_enforced. They are not guessed.
 
 ## Omission and deletion rules that are not workbook cells
 
